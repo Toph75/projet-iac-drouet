@@ -2,7 +2,7 @@
 
 set -eu  -o pipefail
 
-if [ ! -d ".git" ]; then 
+if [ ! -d ".git" ]; then
     git init
 fi
 
@@ -21,11 +21,11 @@ cd infra/envs/dev
 touch main.tf variables.tf versions.tf \
     outputs.tf providers.tf dev.aut.tfvars
 cd ..
-mkdir -p infra/modules/compute 
+mkdir -p infra/modules/compute
 mkdir -p infra/modules/security_group
 
 
 
-for f in infra/modules/compute infra/modules/security_group; do 
+for f in infra/modules/compute infra/modules/security_group; do
     touch "$f"/main.tf "$f"/variables.tf "$f"/versions.tf "$f"/outputs.tf
 done
