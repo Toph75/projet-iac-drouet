@@ -7,6 +7,7 @@ variable "aws_region" {
 variable "vpc_id" {
   description = "ID du VPC AWS"
   type        = string
+  default     = "vpc-05a88ab78b737f861"
 }
 
 variable "allowed_ssh_ip" {
