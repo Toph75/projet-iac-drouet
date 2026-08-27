@@ -1,0 +1,2 @@
+bucket = "REMPLACEZ-PAR-state_bucket_name-DE-LA-SORTIE-BOOTSTRAP"
+region = "eu-west-3"

@@ -1,0 +1,15 @@
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+terraform.tfvars
+backend.hcl
+crash.log
+*.tfplan
+tfplan
+.ansible.cfg
+inventory.ini
+.ansible
+.terraform
+*.pem
+*.key

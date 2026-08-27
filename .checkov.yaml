@@ -1,0 +1,14 @@
+directory:
+  - .
+framework:
+  - terraform
+compact: true
+quiet: false
+download-external-modules: false
+# Exceptions documentées (les commentaires inline #checkov:skip= ne sont pas
+# fiables sur les checks graphés CKV2_*, cf. https://github.com/bridgecrewio/checkov/issues/6414) :
+skip-check:
+  - CKV_AWS_144  # infra mono-région volontairement simple, pas de réplication cross-region (buckets state + logs)
+  - CKV2_AWS_5   # faux positif connu : le SG est bien attaché via module.compute -> vpc_security_group_ids,
+                 # mais l'analyse de graphe de Checkov ne résout pas toujours les références imbriquées
+                 # entre modules (module.security_group.id passé en liste à travers 2 niveaux de module)

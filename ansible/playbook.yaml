@@ -1,0 +1,7 @@
+---
+- name: Deployer Nginx
+  hosts: webservers
+  become: true
+  tasks:
+    - name: Executer les taches
+      include_tasks: roles/tasks/main.yaml

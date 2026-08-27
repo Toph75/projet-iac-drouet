@@ -1,0 +1,51 @@
+- name: Installer Nginx
+  ansible.builtin.dnf:
+    name: nginx
+    state: present
+
+- name: Démarrer et activer le service Nginx
+  ansible.builtin.service:
+    name: nginx
+    state: started
+    enabled: true
+
+- name: Déployer le contenu HTML et CSS
+  ansible.builtin.copy:
+    dest: /usr/share/nginx/html/index.html
+    owner: nginx
+    group: nginx
+    mode: "0644"
+    content: |
+      <!DOCTYPE html>
+      <html lang="fr">
+      <head>
+          <meta charset="UTF-8">
+          <title>Mon Application AWS</title>
+          <style>
+              body {
+                  font-family: Arial, sans-serif;
+                  background-color: #f4f4f9;
+                  color: #333;
+                  display: flex;
+                  justify-content: center;
+                  align-items: center;
+                  height: 100vh;
+                  margin: 0;
+              }
+              .card {
+                  background: white;
+                  padding: 2rem;
+                  border-radius: 8px;
+                  box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+                  text-align: center;
+              }
+              h1 { color: #0066cc; }
+          </style>
+      </head>
+      <body>
+          <div class="card">
+              <h1>Déploiement Nginx Réussi !</h1>
+              <p>Cette page a été configurée automatiquement via Ansible.</p>
+          </div>
+      </body>
+      </html>

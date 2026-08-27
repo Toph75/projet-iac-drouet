@@ -1,0 +1,1015 @@
+
+=== ./bootstrap/main.tf ===
+provider "aws" {
+  region = var.aws_region
+
+  default_tags {
+    tags = var.tags
+  }
+}
+
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+locals {
+  # Nom globalement unique sans dépendre d'un provider random :
+  # compte + région suffisent à garantir l'unicité.
+  state_bucket_name   = "${var.project_name}-tfstate-${data.aws_caller_identity.current.account_id}-${data.aws_region.current.name}"
+  logging_bucket_name = "${var.project_name}-tfstate-logs-${data.aws_caller_identity.current.account_id}-${data.aws_region.current.name}"
+}
+
+# --- Clé KMS dédiée au chiffrement du bucket de state ---
+resource "aws_kms_key" "state" {
+  description         = "Clé KMS pour chiffrer le bucket de state Terraform"
+  enable_key_rotation = true # CKV_AWS_7
+
+  # Policy explicite requise par CKV2_AWS_64 : sans ce bloc, AWS applique
+  # une policy par défaut invisible pour l'analyse statique.
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "EnableRootAccountFullAccess"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
+        Action    = "kms:*"
+        Resource  = "*"
+      },
+      {
+        Sid       = "AllowS3ServiceUseOfTheKey"
+        Effect    = "Allow"
+        Principal = { Service = "s3.amazonaws.com" }
+        Action = [
+          "kms:GenerateDataKey*",
+          "kms:Decrypt"
+        ]
+        Resource = "*"
+        Condition = {
+          StringEquals = {
+            "aws:SourceAccount" = data.aws_caller_identity.current.account_id
+          }
+        }
+      }
+    ]
+  })
+
+  tags = var.tags
+}
+
+resource "aws_kms_alias" "state" {
+  name          = "alias/${var.project_name}-tfstate"
+  target_key_id = aws_kms_key.state.key_id
+}
+
+# --- Bucket cible pour les access logs (requis par CKV_AWS_18 sur le bucket principal) ---
+# NB : CKV_AWS_144 (réplication cross-région) et CKV2_AWS_5/62 (attachement/notifications)
+# sont déclarés en exception dans .checkov.yaml, pas ici (les commentaires inline
+# ne sont pas fiables pour les checks graphés CKV2_*).
+resource "aws_s3_bucket" "logs" {
+  bucket = local.logging_bucket_name
+  #checkov:skip=CKV_AWS_18:bucket de logs lui-même, pas de cible de log récursive nécessaire
+
+  tags = var.tags
+}
+
+resource "aws_s3_bucket_public_access_block" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  block_public_acls       = true
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "logs" {
+  bucket = aws_s3_bucket.logs.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.state.arn
+    }
+    bucket_key_enabled = true
+  }
+}
+
+# CKV2_AWS_61 : lifecycle configuration obligatoire, même sur un bucket de logs
+resource "aws_s3_bucket_lifecycle_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
+
+  rule {
+    id     = "expire-old-logs"
+    status = "Enabled"
+
+    expiration {
+      days = 365
+    }
+
+    noncurrent_version_expiration {
+      noncurrent_days = 90
+    }
+  }
+
+  rule {
+    id     = "abort-incomplete-multipart-upload"
+    status = "Enabled"
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+}
+
+# CKV2_AWS_62 : notifications d'événements activées via EventBridge (pas de
+# SNS/SQS/Lambda dédiés nécessaires pour une infra simple)
+resource "aws_s3_bucket_notification" "logs" {
+  bucket      = aws_s3_bucket.logs.id
+  eventbridge = true
+}
+
+# --- Bucket principal : state Terraform ---
+resource "aws_s3_bucket" "state" {
+  bucket = local.state_bucket_name
+
+  tags = var.tags
+}
+
+resource "aws_s3_bucket_public_access_block" "state" {
+  bucket = aws_s3_bucket.state.id
+
+  block_public_acls       = true # CKV2_AWS_6
+  block_public_policy     = true
+  ignore_public_acls      = true
+  restrict_public_buckets = true
+}
+
+resource "aws_s3_bucket_versioning" "state" {
+  bucket = aws_s3_bucket.state.id
+  versioning_configuration {
+    status = "Enabled" # CKV_AWS_21
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "state" {
+  bucket = aws_s3_bucket.state.id
+
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm     = "aws:kms" # CKV_AWS_19 / CKV_AWS_145
+      kms_master_key_id = aws_kms_key.state.arn
+    }
+    bucket_key_enabled = true
+  }
+}
+
+resource "aws_s3_bucket_logging" "state" {
+  bucket = aws_s3_bucket.state.id
+
+  target_bucket = aws_s3_bucket.logs.id
+  target_prefix = "state-access-logs/"
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "state" {
+  bucket = aws_s3_bucket.state.id
+
+  rule {
+    id     = "expire-old-versions"
+    status = "Enabled"
+
+    noncurrent_version_expiration {
+      noncurrent_days = 90
+    }
+  }
+
+  # CKV_AWS_300 : purge les uploads multipart jamais terminés
+  rule {
+    id     = "abort-incomplete-multipart-upload"
+    status = "Enabled"
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+}
+
+# CKV2_AWS_62 : notifications d'événements activées via EventBridge
+resource "aws_s3_bucket_notification" "state" {
+  bucket      = aws_s3_bucket.state.id
+  eventbridge = true
+}
+
+# Interdit tout accès en clair (HTTP) au bucket de state
+resource "aws_s3_bucket_policy" "state_force_tls" {
+  bucket = aws_s3_bucket.state.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid       = "DenyInsecureTransport"
+      Effect    = "Deny"
+      Principal = "*"
+      Action    = "s3:*"
+      Resource = [
+        aws_s3_bucket.state.arn,
+        "${aws_s3_bucket.state.arn}/*"
+      ]
+      Condition = {
+        Bool = {
+          "aws:SecureTransport" = "false"
+        }
+      }
+    }]
+  })
+}
+
+=== ./bootstrap/outputs.tf ===
+output "state_bucket_name" {
+  description = "Nom du bucket S3 à utiliser comme backend Terraform (voir versions.tf racine)"
+  value       = aws_s3_bucket.state.id
+}
+
+output "state_bucket_arn" {
+  description = "ARN du bucket de state"
+  value       = aws_s3_bucket.state.arn
+}
+
+output "kms_key_arn" {
+  description = "ARN de la clé KMS utilisée pour chiffrer le state"
+  value       = aws_kms_key.state.arn
+}
+
+=== ./bootstrap/variables.tf ===
+variable "aws_region" {
+  description = "Région AWS où créer le bucket de state"
+  type        = string
+  default     = "eu-west-3"
+}
+
+variable "project_name" {
+  description = "Nom du projet, utilisé pour préfixer le bucket de state"
+  type        = string
+  default     = "app"
+}
+
+variable "tags" {
+  description = "Tags communs"
+  type        = map(string)
+  default = {
+    Project   = "infra"
+    ManagedBy = "terraform-bootstrap"
+  }
+}
+
+=== ./bootstrap/versions.tf ===
+terraform {
+  required_version = ">= 1.6.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+
+  # Volontairement PAS de backend S3 ici : ce projet crée le bucket
+  # qui servira de backend au reste de l'infra. Le state de ce
+  # dossier reste local (terraform.tfstate), à conserver précieusement
+  # (ou à migrer manuellement une fois le bucket créé si vous préférez).
+}
+
+=== ./main.tf ===
+module "network" {
+  source = "./modules/network"
+
+  name              = "app"
+  availability_zone = var.availability_zone
+
+  tags = var.default_tags
+}
+
+module "iam" {
+  source = "./modules/iam"
+
+  name = "app"
+  tags = var.default_tags
+}
+
+module "security_group" {
+  source = "./modules/security_group"
+
+  name        = "app-sg"
+  description = "Security group pour l'instance applicative"
+  vpc_id      = module.network.vpc_id
+
+  # Le SSH n'est ouvert que si allowed_ssh_cidr est renseigné.
+  # Par défaut, l'accès se fait via SSM Session Manager (module.iam),
+  # sans exposer le port 22 du tout.
+  ingress_rules = concat(
+    var.allowed_ssh_cidr != null ? [{
+      description = "SSH depuis IP de gestion uniquement"
+      from_port   = 22
+      to_port     = 22
+      protocol    = "tcp"
+      cidr_blocks = [var.allowed_ssh_cidr]
+    }] : [],
+    [{
+      description = "HTTPS depuis l'intérieur du VPC"
+      from_port   = 443
+      to_port     = 443
+      protocol    = "tcp"
+      cidr_blocks = ["10.0.0.0/16"] # doit correspondre à vpc_cidr du module network
+    }]
+  )
+
+  tags = var.default_tags
+}
+
+module "compute" {
+  source = "./modules/compute"
+
+  name                  = "app-instance"
+  ami_id                = var.ami_id
+  subnet_id             = module.network.private_subnet_id
+  security_group_ids    = [module.security_group.security_group_id]
+  associate_public_ip   = false
+  iam_instance_profile  = module.iam.instance_profile_name
+
+  tags = var.default_tags
+}
+
+=== ./modules/compute/main.tf ===
+resource "aws_instance" "this" {
+  ami                         = var.ami_id
+  instance_type               = var.instance_type
+  subnet_id                   = var.subnet_id
+  vpc_security_group_ids      = var.security_group_ids
+  associate_public_ip_address = var.associate_public_ip
+  iam_instance_profile        = var.iam_instance_profile
+
+  monitoring                  = true # CKV_AWS_126 : monitoring détaillé
+  ebs_optimized                = true # CKV_AWS_135 : optimisation EBS
+  disable_api_termination     = var.enable_termination_protection
+
+  metadata_options {
+    http_tokens                 = "required" # CKV_AWS_79 : force IMDSv2
+    http_endpoint                = "enabled"
+    http_put_response_hop_limit = 1
+  }
+
+  root_block_device {
+    encrypted   = true # CKV_AWS_8 : chiffrement du volume racine
+    volume_size = var.root_volume_size
+    volume_type = "gp3"
+  }
+
+  tags = merge(var.tags, {
+    Name = var.name
+  })
+}
+
+=== ./modules/compute/outputs.tf ===
+output "instance_id" {
+  description = "ID de l'instance créée"
+  value       = aws_instance.this.id
+}
+
+output "private_ip" {
+  description = "Adresse IP privée de l'instance"
+  value       = aws_instance.this.private_ip
+}
+
+output "public_ip" {
+  description = "Adresse IP publique de l'instance (null si associate_public_ip = false)"
+  value       = aws_instance.this.public_ip
+}
+
+=== ./modules/compute/variables.tf ===
+variable "name" {
+  description = "Nom de l'instance EC2"
+  type        = string
+}
+
+variable "ami_id" {
+  description = "ID de l'AMI à utiliser"
+  type        = string
+}
+
+variable "instance_type" {
+  description = "Type d'instance EC2"
+  type        = string
+  default     = "t3.micro"
+}
+
+variable "subnet_id" {
+  description = "ID du subnet dans lequel lancer l'instance"
+  type        = string
+}
+
+variable "security_group_ids" {
+  description = "Liste des security groups à attacher à l'instance"
+  type        = list(string)
+}
+
+variable "associate_public_ip" {
+  description = "Associer une IP publique à l'instance (déconseillé, cf. CKV_AWS_88). Passez par un ALB/NAT à la place."
+  type        = bool
+  default     = false
+}
+
+variable "iam_instance_profile" {
+  description = "Nom du profil IAM à attacher (recommandé, cf. CKV2_AWS_41). Laisser null seulement en test."
+  type        = string
+  default     = null
+}
+
+variable "root_volume_size" {
+  description = "Taille du volume racine en Go"
+  type        = number
+  default     = 20
+}
+
+variable "enable_termination_protection" {
+  description = "Active la protection contre la suppression accidentelle (CKV_AWS_135 / bonne pratique prod)"
+  type        = bool
+  default     = false
+}
+
+variable "tags" {
+  description = "Tags communs à appliquer sur la ressource"
+  type        = map(string)
+  default     = {}
+}
+
+=== ./modules/compute/versions.tf ===
+terraform {
+  required_version = ">= 1.6.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+=== ./modules/iam/main.tf ===
+# Rôle assumable uniquement par le service EC2 (principal restreint)
+resource "aws_iam_role" "ec2" {
+  name = "${var.name}-ec2-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+
+  tags = var.tags
+}
+
+# Permet de se connecter à l'instance via AWS Systems Manager Session Manager,
+# sans avoir besoin d'ouvrir le port 22 en entrée sur le security group.
+resource "aws_iam_role_policy_attachment" "ssm" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_instance_profile" "ec2" {
+  name = "${var.name}-ec2-profile"
+  role = aws_iam_role.ec2.name
+
+  tags = var.tags
+}
+
+=== ./modules/iam/outputs.tf ===
+output "instance_profile_name" {
+  description = "Nom du profil d'instance à attacher à l'EC2"
+  value       = aws_iam_instance_profile.ec2.name
+}
+
+output "role_arn" {
+  description = "ARN du rôle IAM de l'instance"
+  value       = aws_iam_role.ec2.arn
+}
+
+=== ./modules/iam/variables.tf ===
+variable "name" {
+  description = "Nom du rôle / profil IAM pour l'instance"
+  type        = string
+}
+
+variable "tags" {
+  description = "Tags communs"
+  type        = map(string)
+  default     = {}
+}
+
+=== ./modules/iam/versions.tf ===
+terraform {
+  required_version = ">= 1.6.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+=== ./modules/network/main.tf ===
+resource "aws_vpc" "this" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+
+  tags = merge(var.tags, {
+    Name = "${var.name}-vpc"
+  })
+}
+
+# CKV2_AWS_12 : le security group par défaut du VPC ne doit autoriser aucun trafic
+resource "aws_default_security_group" "this" {
+  vpc_id = aws_vpc.this.id
+  tags = merge(var.tags, {
+    Name = "${var.name}-default-sg-locked"
+  })
+  # Pas de bloc ingress/egress = toutes les règles par défaut sont supprimées
+}
+
+resource "aws_internet_gateway" "this" {
+  vpc_id = aws_vpc.this.id
+
+  tags = merge(var.tags, {
+    Name = "${var.name}-igw"
+  })
+}
+
+resource "aws_subnet" "public" {
+  vpc_id                  = aws_vpc.this.id
+  cidr_block              = var.public_subnet_cidr
+  availability_zone       = var.availability_zone
+  map_public_ip_on_launch = false # on active l'IP publique uniquement sur la NAT EIP, pas par défaut
+
+  tags = merge(var.tags, {
+    Name = "${var.name}-public-subnet"
+  })
+}
+
+resource "aws_subnet" "private" {
+  vpc_id                  = aws_vpc.this.id
+  cidr_block              = var.private_subnet_cidr
+  availability_zone       = var.availability_zone
+  map_public_ip_on_launch = false # CKV_AWS_130
+
+  tags = merge(var.tags, {
+    Name = "${var.name}-private-subnet"
+  })
+}
+
+resource "aws_eip" "nat" {
+  domain = "vpc"
+
+  tags = merge(var.tags, {
+    Name = "${var.name}-nat-eip"
+  })
+}
+
+resource "aws_nat_gateway" "this" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public.id
+
+  tags = merge(var.tags, {
+    Name = "${var.name}-nat"
+  })
+
+  depends_on = [aws_internet_gateway.this]
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.this.id
+
+  route {
+    cidr_block = "0.0.0.0/0"
+    gateway_id = aws_internet_gateway.this.id
+  }
+
+  tags = merge(var.tags, {
+    Name = "${var.name}-public-rt"
+  })
+}
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.this.id
+
+  route {
+    cidr_block     = "0.0.0.0/0"
+    nat_gateway_id = aws_nat_gateway.this.id
+  }
+
+  tags = merge(var.tags, {
+    Name = "${var.name}-private-rt"
+  })
+}
+
+resource "aws_route_table_association" "public" {
+  subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_route_table_association" "private" {
+  subnet_id      = aws_subnet.private.id
+  route_table_id = aws_route_table.private.id
+}
+
+# --- VPC Flow Logs (CKV2_AWS_11) avec chiffrement KMS du log group (CKV_AWS_158) ---
+
+data "aws_caller_identity" "current" {}
+data "aws_region" "current" {}
+
+resource "aws_kms_key" "flow_logs" {
+  description         = "Clé KMS pour chiffrer les VPC Flow Logs de ${var.name}"
+  enable_key_rotation = true # CKV_AWS_7
+
+  # Policy explicite requise par CKV2_AWS_64
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Sid       = "EnableRootAccountFullAccess"
+        Effect    = "Allow"
+        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
+        Action    = "kms:*"
+        Resource  = "*"
+      },
+      {
+        Sid    = "AllowCloudWatchLogsUseOfTheKey"
+        Effect = "Allow"
+        Principal = {
+          Service = "logs.${data.aws_region.current.name}.amazonaws.com"
+        }
+        Action = [
+          "kms:Encrypt*",
+          "kms:Decrypt*",
+          "kms:ReEncrypt*",
+          "kms:GenerateDataKey*",
+          "kms:Describe*"
+        ]
+        Resource = "*"
+        Condition = {
+          ArnLike = {
+            "kms:EncryptionContext:aws:logs:arn" = "arn:aws:logs:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:log-group:*"
+          }
+        }
+      }
+    ]
+  })
+
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_log_group" "flow_logs" {
+  name              = "/vpc/flow-logs/${var.name}"
+  retention_in_days = var.flow_log_retention_days
+  kms_key_id        = aws_kms_key.flow_logs.arn
+
+  tags = var.tags
+}
+
+resource "aws_iam_role" "flow_logs" {
+  name = "${var.name}-vpc-flow-logs-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Principal = {
+        Service = "vpc-flow-logs.amazonaws.com"
+      }
+      Action = "sts:AssumeRole"
+    }]
+  })
+
+  tags = var.tags
+}
+
+resource "aws_iam_role_policy" "flow_logs" {
+  name = "${var.name}-vpc-flow-logs-policy"
+  role = aws_iam_role.flow_logs.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents",
+        "logs:DescribeLogGroups",
+        "logs:DescribeLogStreams"
+      ]
+      Resource = "${aws_cloudwatch_log_group.flow_logs.arn}:*"
+    }]
+  })
+}
+
+resource "aws_flow_log" "this" {
+  vpc_id                   = aws_vpc.this.id
+  traffic_type             = "ALL"
+  log_destination_type     = "cloud-watch-logs"
+  log_destination          = aws_cloudwatch_log_group.flow_logs.arn
+  iam_role_arn             = aws_iam_role.flow_logs.arn
+  max_aggregation_interval = 60
+
+  tags = var.tags
+}
+
+=== ./modules/network/outputs.tf ===
+output "vpc_id" {
+  description = "ID du VPC créé"
+  value       = aws_vpc.this.id
+}
+
+output "public_subnet_id" {
+  description = "ID du subnet public"
+  value       = aws_subnet.public.id
+}
+
+output "private_subnet_id" {
+  description = "ID du subnet privé (à utiliser pour les instances applicatives)"
+  value       = aws_subnet.private.id
+}
+
+output "nat_gateway_id" {
+  description = "ID de la NAT Gateway"
+  value       = aws_nat_gateway.this.id
+}
+
+=== ./modules/network/variables.tf ===
+variable "name" {
+  description = "Préfixe de nom pour les ressources réseau"
+  type        = string
+}
+
+variable "vpc_cidr" {
+  description = "Bloc CIDR du VPC"
+  type        = string
+  default     = "10.0.0.0/16"
+}
+
+variable "public_subnet_cidr" {
+  description = "Bloc CIDR du subnet public (pour la NAT Gateway)"
+  type        = string
+  default     = "10.0.1.0/24"
+}
+
+variable "private_subnet_cidr" {
+  description = "Bloc CIDR du subnet privé (pour les instances applicatives)"
+  type        = string
+  default     = "10.0.2.0/24"
+}
+
+variable "availability_zone" {
+  description = "Zone de disponibilité utilisée pour les subnets"
+  type        = string
+}
+
+variable "flow_log_retention_days" {
+  description = "Durée de rétention des logs VPC Flow Logs (CKV_AWS_338 recommande >= 365 jours)"
+  type        = number
+  default     = 365
+}
+
+variable "tags" {
+  description = "Tags communs"
+  type        = map(string)
+  default     = {}
+}
+
+=== ./modules/network/versions.tf ===
+terraform {
+  required_version = ">= 1.6.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+=== ./modules/security_group/main.tf ===
+resource "aws_security_group" "this" {
+  name        = var.name
+  description = var.description # requis pour CKV_AWS_23
+  vpc_id      = var.vpc_id
+
+  dynamic "ingress" {
+    for_each = var.ingress_rules
+    content {
+      description = ingress.value.description
+      from_port   = ingress.value.from_port
+      to_port     = ingress.value.to_port
+      protocol    = ingress.value.protocol
+      cidr_blocks = ingress.value.cidr_blocks
+    }
+  }
+
+  dynamic "egress" {
+    for_each = var.egress_rules
+    content {
+      description = egress.value.description
+      from_port   = egress.value.from_port
+      to_port     = egress.value.to_port
+      protocol    = egress.value.protocol
+      cidr_blocks = egress.value.cidr_blocks
+    }
+  }
+
+  tags = merge(var.tags, {
+    Name = var.name
+  })
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+=== ./modules/security_group/outputs.tf ===
+output "security_group_id" {
+  description = "ID du security group créé"
+  value       = aws_security_group.this.id
+}
+
+output "security_group_arn" {
+  description = "ARN du security group créé"
+  value       = aws_security_group.this.arn
+}
+
+=== ./modules/security_group/variables.tf ===
+variable "name" {
+  description = "Nom du security group"
+  type        = string
+}
+
+variable "description" {
+  description = "Description du security group (requis par Checkov CKV_AWS_23 : pas de description vide/générique)"
+  type        = string
+}
+
+variable "vpc_id" {
+  description = "ID du VPC dans lequel créer le security group"
+  type        = string
+}
+
+variable "ingress_rules" {
+  description = "Règles d'entrée. Chaque règle doit avoir une description explicite (CKV_AWS_23)."
+  type = list(object({
+    description = string
+    from_port   = number
+    to_port     = number
+    protocol    = string
+    cidr_blocks = list(string)
+  }))
+  default = []
+
+  validation {
+    # Bloque explicitement l'ouverture de SSH (22) et RDP (3389) au monde entier
+    # -> couvre CKV_AWS_24, CKV_AWS_25, CKV_AWS_260
+    condition = alltrue([
+      for rule in var.ingress_rules :
+      !(
+        contains(rule.cidr_blocks, "0.0.0.0/0") &&
+        (
+          (rule.from_port <= 22 && rule.to_port >= 22) ||
+          (rule.from_port <= 3389 && rule.to_port >= 3389)
+        )
+      )
+    ])
+    error_message = "Interdit : ouverture du port 22 (SSH) ou 3389 (RDP) sur 0.0.0.0/0. Restreignez le cidr_blocks à des IP/ranges précis."
+  }
+}
+
+variable "egress_rules" {
+  description = "Règles de sortie"
+  type = list(object({
+    description = string
+    from_port   = number
+    to_port     = number
+    protocol    = string
+    cidr_blocks = list(string)
+  }))
+  default = [{
+    description = "Autoriser tout le trafic sortant"
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }]
+}
+
+variable "tags" {
+  description = "Tags communs à appliquer sur la ressource"
+  type        = map(string)
+  default     = {}
+}
+
+=== ./modules/security_group/versions.tf ===
+terraform {
+  required_version = ">= 1.6.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+=== ./outputs.tf ===
+output "instance_id" {
+  description = "ID de l'instance déployée"
+  value       = module.compute.instance_id
+}
+
+output "security_group_id" {
+  description = "ID du security group déployé"
+  value       = module.security_group.security_group_id
+}
+
+output "vpc_id" {
+  description = "ID du VPC créé"
+  value       = module.network.vpc_id
+}
+
+=== ./providers.tf ===
+provider "aws" {
+  region = var.aws_region
+
+  default_tags {
+    tags = var.default_tags
+  }
+}
+
+=== ./variables.tf ===
+variable "aws_region" {
+  description = "Région AWS de déploiement"
+  type        = string
+  default     = "eu-west-3"
+}
+
+variable "availability_zone" {
+  description = "Zone de disponibilité pour le VPC créé (ex: eu-west-3a)"
+  type        = string
+}
+
+variable "ami_id" {
+  description = "AMI à utiliser pour l'instance EC2"
+  type        = string
+}
+
+variable "allowed_ssh_cidr" {
+  description = "CIDR précis autorisé en SSH (jamais 0.0.0.0/0). Laissez null pour ne pas ouvrir le port 22 du tout et passer uniquement par SSM Session Manager (recommandé)."
+  type        = string
+  default     = null
+}
+
+variable "default_tags" {
+  description = "Tags appliqués par défaut à toutes les ressources"
+  type        = map(string)
+  default = {
+    Project     = "infra"
+    ManagedBy   = "terraform"
+    Environment = "dev"
+  }
+}
+
+=== ./versions.tf ===
+terraform {
+  required_version = ">= 1.6.0"
+
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+
+  # Configuration de backend volontairement partielle : le bucket n'existe
+  # pas encore au premier lancement. Il est créé par ./bootstrap, puis vous
+  # lancez `terraform init -backend-config=backend.hcl` (voir backend.hcl.example).
+  backend "s3" {
+    key          = "infra/terraform.tfstate"
+    encrypt      = true
+    use_lockfile = true # verrouillage natif S3 (Terraform >= 1.10)
+  }
+}
